@@ -2,11 +2,12 @@
 
 中国裁判文书网检索与 Markdown 导出工具。适用于 Codex、Claude Code 或其它能运行本地命令的智能体。
 
-该 skill 通过本机 Microsoft Edge 的登录态和 Chrome DevTools Protocol 访问 `wenshu.court.gov.cn`，使用站内 JavaScript 检索函数完成搜索、翻页、打开文书详情，并把裁判文书导出为 Markdown 文件。
+该 skill 通过本机 Microsoft Edge 的登录态和 Chrome DevTools Protocol 访问 `wenshu.court.gov.cn`。普通检索使用站内 JavaScript 检索函数完成搜索、翻页、打开文书详情；按案号精确提取时使用网页真实搜索框逐个检索，避免站内状态不同步，并把裁判文书导出为 Markdown 文件。
 
 ## 功能
 
 - 支持自然语言检索入口。
+- 支持按案号批量精确提取，未命中不阻断后续案号。
 - 支持旧版逐项交互输入。
 - 自动解析常见检索条件：
   - 法院层级：最高法院、高级法院、中级法院、基层法院
@@ -26,7 +27,7 @@
 - Python 3.10+
 - Microsoft Edge
 - Python 依赖：`playwright`
-- 已在默认 Edge 用户配置中登录中国裁判文书网
+- 已在暴露 `127.0.0.1:9222` 的 Edge 用户配置中登录中国裁判文书网
 - 脚本能访问或启动 Edge 调试端口：`127.0.0.1:9222`
 
 安装依赖：
@@ -68,6 +69,28 @@ python "$env:USERPROFILE\.codex\skills\wenshu-court-search\scripts\wenshu_search
 python "$env:USERPROFILE\.codex\skills\wenshu-court-search\scripts\wenshu_search.py" --query "检索2025年高级法院执行案件调解书，全文包含“执行异议”的导出5篇"
 ```
 
+## 按案号精确提取
+
+案号检索请优先使用专用模式。脚本会逐个案号执行：
+
+1. 打开文书列表页。
+2. 点击“清空搜索条件”。
+3. 在真实搜索框中输入当前案号并按 Enter。
+4. 仅当详情页正文包含目标案号时保存 Markdown。
+5. 未命中则记录到 `批量案号提取汇总.md` 并继续。
+
+```powershell
+python "$env:USERPROFILE\.codex\skills\wenshu-court-search\scripts\wenshu_search.py" --case-nos "（2025）最高法民再354号,（2023）最高法知民终1511号" --connect-only
+```
+
+案号较多时，每行一个案号：
+
+```powershell
+python "$env:USERPROFILE\.codex\skills\wenshu-court-search\scripts\wenshu_search.py" --case-file .\案号.txt --connect-only
+```
+
+如果 `--query` 中包含案号，脚本也会转入案号专用模式。
+
 ## 交互式调用
 
 不传 `--query` 时进入逐项输入模式：
@@ -94,10 +117,16 @@ python "$env:USERPROFILE\.codex\skills\wenshu-court-search\scripts\wenshu_search
 
 ## 输出结构
 
-每次运行会在当前工作目录生成新文件夹：
+普通检索每次运行会在当前工作目录生成新文件夹：
 
 ```text
 裁判文书_YYYYMMDD_HHMMSS_关键词
+```
+
+案号批量模式会为每个案号生成一个独立文件夹，并在当前工作目录生成：
+
+```text
+批量案号提取汇总.md
 ```
 
 目录内容：
@@ -139,7 +168,19 @@ python "$env:USERPROFILE\.codex\skills\wenshu-court-search\scripts\wenshu_search
 python "$env:USERPROFILE\.codex\skills\wenshu-court-search\scripts\wenshu_search.py" --query "下载最高法院裁判的民事案件中包含“无明显不当”内容的20篇裁判文书"
 ```
 
+当用户给出一个或多个案号时，智能体应优先调用 `--case-nos` 或 `--case-file`，并使用 `--connect-only` 连接用户已登录的专用 Edge 窗口。不要把多个案号一次性叠加为多个“全文”条件；裁判文书网会把它们作为 AND 条件，导致结果为 0。
+
 仅在请求缺少关键意图、目标网站不可用、登录态失效或用户要求精确字段控制时，再改用交互式模式或询问澄清问题。
+
+## 推荐登录流程
+
+为避免破坏用户普通 Edge 会话，推荐启动专用 profile：
+
+```powershell
+Start-Process -FilePath 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' -ArgumentList @('--remote-debugging-port=9222','--user-data-dir=C:\tmp\wenshu-edge-profile','--no-first-run','--profile-directory=Default','https://wenshu.court.gov.cn/website/wenshu/181217BMTKHNT2W0/index.html')
+```
+
+用户在该窗口完成登录、验证码或滑块验证后，再运行脚本并加 `--connect-only`。
 
 ## 常见问题
 
@@ -164,11 +205,27 @@ python "$env:USERPROFILE\.codex\skills\wenshu-court-search\scripts\wenshu_search
 - 手动完成验证后重新运行。
 - 查看输出目录中的 `artifacts/list_page_*.txt`。
 
-### Edge 被自动重启
+### Edge 被自动启动
 
-如果 `127.0.0.1:9222` 不可用，脚本会尝试关闭并重启 Edge，以启用远程调试端口并使用默认用户配置。
+如果 `127.0.0.1:9222` 不可用，脚本默认会启动一个专用 Edge profile：`C:\tmp\wenshu-edge-profile`。脚本不应关闭用户普通 Edge。
 
-如不希望脚本自动重启 Edge，可先手动用调试端口启动 Edge，或在已有调试端口可用时再运行脚本。
+如不希望脚本自动启动 Edge，可先手动用调试端口启动 Edge，并传入 `--connect-only` 或 `--no-start-edge`。
+
+### 搜索条件越叠越多，最后 0 篇
+
+这是裁判文书网的条件组合行为：多个“全文”条件会被当作 AND。按案号批量时必须每次先清空搜索条件。新版 `--case-nos` / `--case-file` 模式已内置该保护。
+
+### 明明列表命中，导出却显示未匹配
+
+详情页“案号”字段偶尔会暴露 HTML 残片。新版案号模式不再只依赖字段值，而是检查详情页全文/正文是否包含目标案号。
+
+### 中断后浏览器还在自动打开
+
+通常是批量脚本进程仍在后台运行。先检查并停止残留进程：
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'wenshu_search|remote-debugging-port=9222|wenshu-edge-profile' }
+```
 
 ### Claude Code 等其它智能体能否使用
 

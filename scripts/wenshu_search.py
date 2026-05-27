@@ -20,6 +20,7 @@ except ImportError as exc:
 CDP_URL = "http://127.0.0.1:9222"
 EDGE_EXE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 EDGE_PROFILE = r"C:\Users\zyrenguangke\AppData\Local\Microsoft\Edge\User Data"
+DEDICATED_EDGE_PROFILE = r"C:\tmp\wenshu-edge-profile"
 LIST_BASE = "https://wenshu.court.gov.cn/website/wenshu/181217BMTKHNT2W0/index.html"
 DETAIL_MARKER = "181107ANFZ0BXSK4"
 SKIP_VALUES = {"", "无", "none", "None", "NONE", "null", "NULL"}
@@ -121,6 +122,17 @@ def extract_query_count(text: str) -> int:
     return 5
 
 
+def extract_case_numbers(text: str) -> list[str]:
+    case_numbers = re.findall(r"（\d{4}）[^，。,；;：:\s]+?号", text)
+    seen = set()
+    ordered = []
+    for case_no in case_numbers:
+        if case_no not in seen:
+            seen.add(case_no)
+            ordered.append(case_no)
+    return ordered
+
+
 def parse_natural_query(query: str) -> tuple[dict, int, str]:
     raw = empty_filters()
     text = query.strip()
@@ -176,31 +188,31 @@ def cdp_available() -> bool:
         return False
 
 
-def restart_edge():
+def start_edge(profile_dir: str = DEDICATED_EDGE_PROFILE):
     list_url = f"{LIST_BASE}?pageId={uuid.uuid4().hex}"
-    args = (
-        f"--remote-debugging-port=9222 "
-        f'--user-data-dir="{EDGE_PROFILE}" '
-        f"--profile-directory=Default "
-        f'"{list_url}"'
-    )
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", "Stop-Process -Name msedge -Force -ErrorAction SilentlyContinue"],
-        check=False,
-    )
-    subprocess.Popen([EDGE_EXE, args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    args = [
+        "--remote-debugging-port=9222",
+        f"--user-data-dir={profile_dir}",
+        "--profile-directory=Default",
+        "--no-first-run",
+        list_url,
+    ]
+    subprocess.Popen([EDGE_EXE, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(30):
         if cdp_available():
             return
         time.sleep(1)
-    raise RuntimeError("Edge 已尝试重启，但 127.0.0.1:9222 仍不可连接。")
+    raise RuntimeError("Edge 已尝试启动，但 127.0.0.1:9222 仍不可连接。")
 
 
-def ensure_edge():
+def ensure_edge(connect_only: bool = False, start: bool = True, profile_dir: str = DEDICATED_EDGE_PROFILE):
     if cdp_available():
         return
-    print("未检测到 Edge 调试端口 9222，正在自动重启 Edge。")
-    restart_edge()
+    if connect_only or not start:
+        raise RuntimeError("未检测到 Edge 调试端口 9222。请先启动专用 Edge 并登录裁判文书网。")
+    print(f"未检测到 Edge 调试端口 9222，正在启动专用 Edge profile：{profile_dir}")
+    start_edge(profile_dir)
 
 
 def clean_text(text: str) -> str:
@@ -249,7 +261,8 @@ def extract_after_label(text: str, label: str) -> str:
 def extract_case_no(text: str) -> str:
     explicit = extract_after_label(text, "案 号")
     if explicit and "号" in explicit:
-        return explicit
+        match = re.search(r"（\d{4}）[^，。,；;：:\s<>\"']+?号", explicit)
+        return match.group(0) if match else explicit
     match = re.search(r"（\d{4}）最高法[^\s，。,；;：:]{1,40}?号", text)
     if match:
         return match.group(0)
@@ -513,6 +526,50 @@ def click_next(page) -> bool:
     )
 
 
+def clear_search_conditions(page):
+    page.evaluate(
+        """() => {
+            const clear = [...document.querySelectorAll('a, button, span')]
+                .find(el => (el.innerText || '').trim() === '清空搜索条件');
+            if (clear) clear.click();
+        }"""
+    )
+    page.wait_for_timeout(5000)
+
+
+def search_single_case_no(page, case_no: str) -> tuple[str, list[dict]]:
+    page.goto(LIST_BASE, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(8000)
+    clear_search_conditions(page)
+    box = page.locator("input.searchKey").nth(0)
+    box.click()
+    page.keyboard.press("Control+A")
+    page.keyboard.type(case_no)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(15000)
+    body_text = page.evaluate("document.body.innerText")
+    selected_text = page.evaluate(
+        """() => {
+            const text = document.body.innerText || '';
+            const start = text.indexOf('已选条件');
+            const end = text.indexOf('共检索到');
+            return start >= 0 && end > start ? text.slice(start, end) : '';
+        }"""
+    )
+    selected_count = selected_text.count(case_no)
+    if selected_count != 1:
+        raise RuntimeError(f"搜索条件异常：当前案号出现 {selected_count} 次；已选条件={selected_text.strip()}")
+    links = page.eval_on_selector_all(
+        "a.caseName[href]",
+        """els => els.map(a => ({
+            href: a.href,
+            text: (a.innerText || a.getAttribute('title') || '').trim(),
+            title: a.getAttribute('title') || ''
+        })).filter(x => x.href.includes('181107ANFZ0BXSK4'))""",
+    )
+    return body_text, links
+
+
 def extract_one(context, link: dict, index: int, out_dir: Path, keywords: list[str]) -> dict:
     detail = context.new_page()
     try:
@@ -545,6 +602,44 @@ def extract_one(context, link: dict, index: int, out_dir: Path, keywords: list[s
     filename = sanitize_filename(f"{index:03d}_{case_no or '未识别案号'}_{title}.md")
     path = out_dir / filename
     path.write_text(markdown_for_doc(meta, keywords), encoding="utf-8")
+    meta["path"] = str(path)
+    meta["filename"] = filename
+    return meta
+
+
+def extract_one_exact_case(context, link: dict, index: int, out_dir: Path, case_no: str) -> dict:
+    detail = context.new_page()
+    try:
+        detail.goto(link["href"], wait_until="domcontentloaded", timeout=60000)
+        detail.wait_for_timeout(7000)
+        text = clean_text(detail.evaluate("document.body.innerText"))
+        decoded_url = unquote(detail.url)
+    finally:
+        detail.close()
+
+    body = extract_body(text)
+    if case_no not in text and case_no not in body:
+        raise RuntimeError(f"详情页未包含目标案号：{case_no}")
+
+    title = extract_title(text, link.get("title") or link.get("text") or case_no)
+    cause = extract_after_label(text, "案 由")
+    publish_date_raw = extract_after_label(text, "发布日期")
+    publish_match = re.search(r"\d{4}-\d{2}-\d{2}", publish_date_raw)
+    publish_date = publish_match.group(0) if publish_match else publish_date_raw
+    paras = keyword_paragraphs(body, [case_no])
+    meta = {
+        "index": index,
+        "title": title,
+        "case_no": case_no,
+        "cause": cause,
+        "publish_date": publish_date,
+        "href": decoded_url,
+        "body": body,
+        "keyword_paragraphs": paras,
+    }
+    filename = sanitize_filename(f"{index:03d}_{case_no}_{title}.md")
+    path = out_dir / filename
+    path.write_text(markdown_for_doc(meta, [case_no]), encoding="utf-8")
     meta["path"] = str(path)
     meta["filename"] = filename
     return meta
@@ -603,16 +698,119 @@ def write_record(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="通过 Edge 登录态检索中国裁判文书网并导出 Markdown。")
     parser.add_argument("--query", default="", help="自然语言检索请求；未提供时进入逐项交互输入模式。")
+    parser.add_argument("--case-nos", default="", help="按案号逐个检索，多个案号用逗号、分号或空白分隔。")
+    parser.add_argument("--case-file", default="", help="按案号逐个检索，每行一个案号。")
+    parser.add_argument("--connect-only", action="store_true", help="仅连接已有 9222 Edge；若端口不可用则失败，不自动启动。")
+    parser.add_argument("--no-start-edge", action="store_true", help="若 9222 不可用，不自动启动 Edge。")
+    parser.add_argument("--edge-profile", default=DEDICATED_EDGE_PROFILE, help="自动启动 Edge 时使用的专用用户目录。")
     return parser.parse_args()
+
+
+def parse_case_no_args(args: argparse.Namespace) -> list[str]:
+    values = []
+    if args.case_file:
+        values.extend(Path(args.case_file).read_text(encoding="utf-8").splitlines())
+    if args.case_nos:
+        values.extend(re.split(r"[\s,，;；]+", args.case_nos))
+    if args.query and not values:
+        values.extend(extract_case_numbers(args.query))
+    seen = set()
+    result = []
+    for value in values:
+        value = value.strip()
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def write_empty_case_record(out_dir: Path, case_no: str, body_text: str, status: str):
+    failures = [status] if status.startswith("失败") else []
+    write_record(
+        out_dir,
+        [f"全文={case_no}"],
+        total_result_text(body_text),
+        [],
+        0,
+        failures,
+        f"全文检索案号{case_no}",
+        {"全文关键词": case_no},
+    )
+
+
+def run_case_numbers(args: argparse.Namespace, case_numbers: list[str]):
+    ensure_edge(args.connect_only, not args.no_start_edge, args.edge_profile)
+    summary = []
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(CDP_URL)
+        context = browser.contexts[0]
+        page = context.new_page()
+        try:
+            for index, case_no in enumerate(case_numbers, 1):
+                print(f"\n[{index}/{len(case_numbers)}] {case_no}")
+                out_dir = make_output_dir(Path.cwd(), case_no)
+                artifacts = out_dir / "artifacts"
+                try:
+                    body_text, links = search_single_case_no(page, case_no)
+                    (artifacts / "list_page_001.txt").write_text(body_text, encoding="utf-8")
+                    if not links:
+                        write_empty_case_record(out_dir, case_no, body_text, "未命中")
+                        summary.append((case_no, "未命中"))
+                        print("未命中")
+                        continue
+
+                    extracted = []
+                    failures = []
+                    for link in links[:5]:
+                        try:
+                            extracted.append(extract_one_exact_case(context, link, 1, out_dir, case_no))
+                            break
+                        except Exception as exc:
+                            failures.append(f"{link['href']} | {exc}")
+
+                    if extracted:
+                        write_record(
+                            out_dir,
+                            [f"全文={case_no}"],
+                            total_result_text(body_text),
+                            extracted,
+                            0,
+                            failures,
+                            f"全文检索案号{case_no}",
+                            {"全文关键词": case_no},
+                        )
+                        status = f"已导出：{extracted[0]['filename']}"
+                    else:
+                        status = "未命中：结果中无案号完全匹配的文书"
+                        write_empty_case_record(out_dir, case_no, body_text, status)
+                    summary.append((case_no, status))
+                    print(status)
+                except Exception as exc:
+                    status = f"失败：{exc}"
+                    write_empty_case_record(out_dir, case_no, "", status)
+                    summary.append((case_no, status))
+                    print(status)
+                time.sleep(2)
+        finally:
+            page.close()
+
+    lines = ["# 批量案号提取汇总", ""]
+    lines.extend(f"- {case_no}：{status}" for case_no, status in summary)
+    Path("批量案号提取汇总.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n批量完成，已写入：批量案号提取汇总.md")
 
 
 def run():
     args = parse_args()
+    case_numbers = parse_case_no_args(args)
+    if case_numbers:
+        run_case_numbers(args, case_numbers)
+        return
     original_query = args.query.strip()
     raw, target_total, keyword = collect_inputs(original_query)
     out_dir = make_output_dir(Path.cwd(), keyword)
     artifacts = out_dir / "artifacts"
-    ensure_edge()
+    ensure_edge(args.connect_only, not args.no_start_edge, args.edge_profile)
 
     extracted = []
     failures = []
